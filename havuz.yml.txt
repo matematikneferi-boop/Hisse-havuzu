@@ -1,0 +1,209 @@
+name: Havuzu kur ve yayinla
+
+# Her gece 04:00 (TSI) calisir. Actions sekmesinden elle de baslatabilirsin.
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      tam_yenile:
+        description: "Sifirdan kur (ayda bir kez onerilir)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: havuz
+  cancel-in-progress: false
+
+jobs:
+  havuz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Tarayici kur
+        run: |
+          npm init -y >/dev/null 2>&1 || true
+          npm i -D playwright@1.49.1
+          npx playwright install --with-deps chromium
+
+      - name: Havuzu uret
+        env:
+          PD_SURE_DK: "300"
+          PD_TAM_YENILE: ${{ inputs.tam_yenile }}
+        run: |
+          cat > uret.mjs <<'BETIK'
+          /**
+           * havuz-uret.mjs — havuzu SUNUCUDA kurar.
+           *
+           * Neden başsız tarayıcı? Havuzu üreten mantık (38 gösterge, kombinasyon
+           * sayımı, Wilson, otomatik hedef) sayfanın içinde. Bunu Node'a yeniden
+           * yazmak, zamanla telefondaki sürümden sapacak ikinci bir kod tabanı
+           * demek olurdu. Bunun yerine SAYFANIN KENDİSİ açılıp sürdürülüyor:
+           * üretilen havuz, telefonda kurulacak olanla birebir aynı kodun ürünü.
+           *
+           * Akış:
+           *   1. index.html'i aç
+           *   2. Depodaki havuz.json'u sayfaya yükle (varsa) → kaldığı yerden devam
+           *   3. Havuzu kur / günlük ekle
+           *   4. Süre bütçesi dolunca ya da iş bitince durdur
+           *   5. Havuzu havuz.json olarak yaz
+           *
+           * Ortam değişkenleri:
+           *   PD_SURE_DK      süre bütçesi, dakika (varsayılan 300)
+           *   PD_TAM_YENILE   "true" ise mevcut havuz yok sayılıp sıfırdan kurulur
+           *   PD_SAYFA        html dosyasının yolu (varsayılan index.html)
+           */
+          import { chromium } from "playwright";
+          import { readFile, writeFile, access } from "node:fs/promises";
+          import { resolve } from "node:path";
+          import { pathToFileURL } from "node:url";
+
+          const KOK = process.cwd();
+          const SAYFA = resolve(KOK, process.env.PD_SAYFA || "index.html");
+          const CIKTI = resolve(KOK, "havuz.json");
+          const SURE_MS = (Number(process.env.PD_SURE_DK) || 300) * 60_000;
+          const TAM_YENILE = String(process.env.PD_TAM_YENILE || "") === "true";
+
+          const dk = ms => (ms / 60_000).toFixed(1);
+          const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
+          const varMi = async p => { try { await access(p); return true; } catch { return false; } };
+
+          const tarayici = await chromium.launch({ args: ["--disable-dev-shm-usage"] });
+          const sayfa = await tarayici.newPage();
+
+          sayfa.on("pageerror", e => log("⚠ sayfa hatası:", e.message));
+
+          let cikisKodu = 0;
+          try {
+            if (!(await varMi(SAYFA))) throw new Error("sayfa bulunamadı: " + SAYFA);
+            await sayfa.goto(pathToFileURL(SAYFA).href, { waitUntil: "load" });
+
+            // Sayfa açılışını (depo okuma, çip çizimi) bitirmesini bekle
+            await sayfa.waitForFunction(() => !!window.pdOtomasyon, null, { timeout: 60_000 });
+
+            const toplamHisse = await sayfa.evaluate(() => window.pdOtomasyon.hisseSayisi());
+            log(`sayfa hazır · ${toplamHisse} hisse · süre bütçesi ${dk(SURE_MS)} dk`);
+
+            // ---- 1) Önceki havuzu yükle (varsa) ----
+            let oncekiSira = 0, oncekiImza = null;
+            if (!TAM_YENILE && (await varMi(CIKTI))) {
+              const ham = await readFile(CIKTI, "utf8");
+              try {
+                const h = JSON.parse(ham);
+                if (h && h.tf && Object.keys(h.tf).length) {
+                  await sayfa.evaluate(j => window.pdOtomasyon.havuzYaz(j), ham);
+                  oncekiSira = h.sira || 0;
+                  oncekiImza = h.imza || null;
+                  log(`önceki havuz yüklendi · ${oncekiSira}/${h.toplam || "?"} hisse · ${(ham.length / 1048576).toFixed(1)} MB`);
+                }
+              } catch { log("önceki havuz.json okunamadı, sıfırdan kurulacak"); }
+            } else if (TAM_YENILE) {
+              log("tam yenileme istendi — önceki havuz yok sayılıyor");
+            }
+
+            // İmza değişmişse (ufuk/hedef/mod ayarları) eski havuz zaten geçersizdir
+            const imza = (await sayfa.evaluate(() => window.pdOtomasyon.durum())).imza;
+            if (oncekiImza && oncekiImza !== imza) {
+              log(`⚠ imza değişmiş ("${oncekiImza}" → "${imza}") — havuz sıfırdan kurulacak`);
+              oncekiSira = 0;
+            }
+
+            // ---- 2) İşi başlat ----
+            // Havuz tamamlanmışsa günlük ekleme, değilse (kaldığı yerden) kurulum.
+            const tamamMi = oncekiSira > 0 && oncekiSira >= toplamHisse && oncekiImza === imza;
+            const is = tamamMi ? "gunlukEkle" : "kur";
+            log(`iş: ${is === "kur" ? "havuz kurulumu" : "günlük ekleme"}`);
+            const basladi = await sayfa.evaluate(a => window.pdOtomasyon[a](), is);
+            if (!basladi) throw new Error("iş başlatılamadı (başka bir iş çalışıyor olabilir)");
+
+            // ---- 3) Süre bütçesi dolana ya da iş bitene kadar bekle ----
+            const t0 = Date.now();
+            let durduruldu = false, sonRapor = 0;
+            for (;;) {
+              await sayfa.waitForTimeout(5_000);
+              const d = await sayfa.evaluate(() => window.pdOtomasyon.durum());
+              if (!d.calisiyor) { log("iş kendiliğinden bitti"); break; }
+
+              const gecen = Date.now() - t0;
+              if (gecen - sonRapor >= 60_000) {
+                sonRapor = gecen;
+                log(`${dk(gecen)} dk · ${d.ilerleme || "…"}`);
+              }
+              if (gecen >= SURE_MS && !durduruldu) {
+                durduruldu = true;
+                log(`süre bütçesi doldu (${dk(gecen)} dk) — iş durduruluyor, ilerleme korunacak`);
+                await sayfa.evaluate(() => window.pdOtomasyon.durdur());
+              }
+              // Durdurma emrinden sonra işçilerin kapanması için ek süre tanı
+              if (durduruldu && gecen >= SURE_MS + 180_000) {
+                log("⚠ iş durdurma emrine yanıt vermedi, eldekiyle devam ediliyor");
+                break;
+              }
+            }
+
+            // ---- 4) Havuzu yaz ----
+            const json = await sayfa.evaluate(() => window.pdOtomasyon.havuzAl());
+            if (!json) throw new Error("havuz üretilmedi (boş)");
+            const son = JSON.parse(json);
+            if (!son.tf || !Object.keys(son.tf).length) throw new Error("havuzda hiç dilim yok");
+
+            // Geriye gidişi engelle: yeni sonuç eskisinden azsa dosyayı bozma
+            if (oncekiSira && (son.sira || 0) < oncekiSira && !TAM_YENILE) {
+              throw new Error(`ilerleme geriledi (${oncekiSira} → ${son.sira}) — dosya korunuyor`);
+            }
+
+            await writeFile(CIKTI, json, "utf8");
+            log(`✔ havuz.json yazıldı · ${(json.length / 1048576).toFixed(2)} MB · ` +
+                `${son.sira || 0}/${son.toplam || 0} hisse · ${Object.keys(son.tf).length} dilim · ` +
+                `${son.hata || 0} hata`);
+            if ((son.sira || 0) < (son.toplam || 0))
+              log(`ℹ havuz henüz tamam değil — yarınki tur ${son.sira}. hisseden devam edecek`);
+
+          } catch (e) {
+            log("✘ HATA:", e.message);
+            cikisKodu = 1;
+          } finally {
+            await tarayici.close();
+          }
+          process.exit(cikisKodu);
+          BETIK
+          node uret.mjs
+
+      - name: Havuzu depoya yaz
+        run: |
+          if [ ! -s havuz.json ]; then
+            echo "havuz.json uretilemedi"
+            exit 1
+          fi
+          git config user.name  "havuz-botu"
+          git config user.email "havuz-botu@users.noreply.github.com"
+          git add havuz.json
+          if git diff --staged --quiet; then
+            echo "Degisiklik yok."
+          else
+            git commit -m "havuz guncellendi - $(date -u +%Y-%m-%d)"
+            git push
+          fi
+
+      - name: Ozet
+        if: always()
+        run: |
+          {
+            echo "### Havuz durumu"
+            if [ -s havuz.json ]; then
+              echo "- Boyut: $(du -h havuz.json | cut -f1)"
+              node -e "const h=require('./havuz.json');console.log('- Ilerleme: '+(h.sira||0)+'/'+(h.toplam||0)+' hisse');console.log('- Dilim: '+Object.keys(h.tf||{}).length)"
+            else
+              echo "- havuz.json yok"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
